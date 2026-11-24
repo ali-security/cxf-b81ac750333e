@@ -1,0 +1,108 @@
+name: seal-build
+
+# Apache CXF 2.7.x has no GitHub Actions CI upstream; this workflow follows
+# BUILDING.txt (mvn install with tests) for the cxf-rt-rs-security-xml module
+# and runs the JAX-RS security system tests that exercise it.
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Surefire -Dtest selector; empty runs the full suite"
+        required: false
+        default: ""
+
+env:
+  MAVEN_OPTS: "-Xmx2g -XX:MaxPermSize=512m"
+  MVN_FLAGS: "-B -e -Dmaven.javadoc.skip=true -Dmaven.source.skip=true -Dgpg.skip=true -Dcheckstyle.skip=true -Dpmd.skip=true"
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+
+      # The 2.7.18 release jar was built with JDK 1.7.0_71 (Build-Jdk in its manifest).
+      # setup-java can no longer provision JDK 7, so install Oracle JDK 7u80 directly.
+      - name: Install Oracle JDK 7u80
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -fsSL -o jdk7.tar.gz https://repo.huaweicloud.com/java/jdk/7u80-b15/jdk-7u80-linux-x64.tar.gz
+          echo "bad9a731639655118740bee119139c1ed019737ec802a630dd7ad7aab4309623  jdk7.tar.gz" | sha256sum -c -
+          tar xzf jdk7.tar.gz
+          echo "JAVA_HOME=$RUNNER_TEMP/jdk1.7.0_80" >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/jdk1.7.0_80/bin" >> "$GITHUB_PATH"
+
+      - name: Install Maven 3.3.9
+        run: |
+          curl -fsSL https://archive.apache.org/dist/maven/maven-3/3.3.9/binaries/apache-maven-3.3.9-bin.tar.gz | tar xz -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/apache-maven-3.3.9/bin" >> "$GITHUB_PATH"
+
+      # JDK 7 TLS/cacerts cannot reach today's Maven Central over HTTPS.
+      - name: Configure Maven mirror
+        run: |
+          mkdir -p ~/.m2
+          cat > ~/.m2/settings.xml <<'EOF'
+          <settings>
+            <mirrors>
+              <mirror>
+                <id>central-http</id>
+                <mirrorOf>*</mirrorOf>
+                <url>http://insecure.repo1.maven.org/maven2</url>
+              </mirror>
+            </mirrors>
+          </settings>
+          EOF
+          java -version
+          mvn -version
+
+      - name: Build and test cxf-rt-rs-security-xml
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            mvn $MVN_FLAGS clean install -pl testutils,rt/rs/security/xml -Dtest=${{ inputs.test-filter }} -DfailIfNoTests=false
+          else
+            mvn $MVN_FLAGS clean install -pl testutils,rt/rs/security/xml
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cxf-rt-rs-security-xml
+          path: rt/rs/security/xml/target/cxf-rt-rs-security-xml-*.jar
+          if-no-files-found: error
+
+      - name: JAX-RS security system tests (systests/rs-security)
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            mvn $MVN_FLAGS test -pl systests/rs-security -Dtest=${{ inputs.test-filter }} -DfailIfNoTests=false
+          else
+            mvn $MVN_FLAGS test -pl systests/rs-security
+          fi
+
+      - name: Surefire results summary
+        if: always()
+        run: |
+          python3 - <<'EOF'
+          import glob, xml.etree.ElementTree as ET
+          tot = {"tests": 0, "failures": 0, "errors": 0, "skipped": 0}
+          for mod in ["testutils", "rt/rs/security/xml", "systests/rs-security"]:
+              m = {"tests": 0, "failures": 0, "errors": 0, "skipped": 0}
+              for f in sorted(glob.glob(mod + "/target/surefire-reports/TEST-*.xml")):
+                  r = ET.parse(f).getroot()
+                  for k in m:
+                      m[k] += int(r.get(k, 0) or 0)
+                  for tc in r.iter("testcase"):
+                      sk = tc.find("skipped")
+                      if sk is not None:
+                          print("SKIPPED %s.%s: %s" % (tc.get("classname"), tc.get("name"),
+                                sk.get("message") or "(@Ignore without message in upstream source)"))
+              passed = m["tests"] - m["failures"] - m["errors"] - m["skipped"]
+              print("MODULE %s: tests=%d passed=%d failures=%d errors=%d skipped=%d" % (
+                  mod, m["tests"], passed, m["failures"], m["errors"], m["skipped"]))
+              for k in tot:
+                  tot[k] += m[k]
+          passed = tot["tests"] - tot["failures"] - tot["errors"] - tot["skipped"]
+          print("SUMMARY: tests=%d passed=%d failures=%d errors=%d skipped=%d" % (
+              tot["tests"], passed, tot["failures"], tot["errors"], tot["skipped"]))
+          EOF

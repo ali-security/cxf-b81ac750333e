@@ -25,17 +25,28 @@ import java.util.zip.DataFormatException;
 import java.util.zip.Deflater;
 import java.util.zip.Inflater;
 import org.apache.cxf.common.util.PropertyUtils;
+import org.apache.cxf.common.util.SystemPropertyAction;
 import org.apache.cxf.message.Message;
 import org.apache.cxf.phase.PhaseInterceptorChain;
 
 public class DeflateEncoderDecoder {
+    // Guards against decompression-bomb style inputs that expand to an unbounded size on the heap
+    public static final long DEFAULT_MAX_INFLATED_SIZE =
+        getIntegerProperty("org.apache.cxf.compression-max-inflated-size", 10 * 1024 * 1024);
+
     public InputStream inflateToken(byte[] deflatedToken) 
+        throws DataFormatException {
+        return inflateToken(deflatedToken, DEFAULT_MAX_INFLATED_SIZE);
+    }
+
+    public InputStream inflateToken(byte[] deflatedToken, long maxInflatedSize)
         throws DataFormatException {
         Inflater inflater = new Inflater(true);
         inflater.setInput(deflatedToken);
 
         byte[] buffer = new byte[deflatedToken.length];
         int inflateLen;
+        long totalInflated = 0;
         ByteArrayOutputStream inflatedToken = new ByteArrayOutputStream();
         while (!inflater.finished()) {
             inflateLen = inflater.inflate(buffer, 0, deflatedToken.length);
@@ -47,6 +58,12 @@ public class DeflateEncoderDecoder {
                 }
             }
             
+            totalInflated += inflateLen;
+            if (totalInflated > maxInflatedSize) {
+                throw new DataFormatException("Inflated data exceeds the maximum allowed size of "
+                    + maxInflatedSize + " bytes");
+            }
+
             inflatedToken.write(buffer, 0, inflateLen);
         }
 
@@ -89,5 +106,17 @@ public class DeflateEncoderDecoder {
             level = Deflater.DEFLATED;
         }
         return level;
+    }
+
+    private static int getIntegerProperty(String name, int def) {
+        String value = SystemPropertyAction.getPropertyOrNull(name);
+        if (value != null) {
+            try {
+                return Integer.parseInt(value.trim());
+            } catch (NumberFormatException ex) {
+                // fall back to the default value
+            }
+        }
+        return def;
     }
 }

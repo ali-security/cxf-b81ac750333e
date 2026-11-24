@@ -22,6 +22,11 @@ package org.apache.cxf.rs.security.xml;
 import java.io.InputStream;
 import java.security.PublicKey;
 import java.security.cert.X509Certificate;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
 
 import javax.xml.stream.XMLStreamReader;
 
@@ -48,6 +53,16 @@ import org.apache.xml.security.transforms.Transforms;
 import org.apache.xml.security.utils.Constants;
 
 public class AbstractXmlSigInHandler extends AbstractXmlSecInHandler {
+
+    private static final Set<String> ALLOWED_TRANSFORMS = Collections.unmodifiableSet(
+        new HashSet<String>(Arrays.asList(
+            Transforms.TRANSFORM_ENVELOPED_SIGNATURE,
+            Transforms.TRANSFORM_C14N_OMIT_COMMENTS,
+            Transforms.TRANSFORM_C14N_WITH_COMMENTS,
+            Transforms.TRANSFORM_C14N11_OMIT_COMMENTS,
+            Transforms.TRANSFORM_C14N11_WITH_COMMENTS,
+            Transforms.TRANSFORM_C14N_EXCL_OMIT_COMMENTS,
+            Transforms.TRANSFORM_C14N_EXCL_WITH_COMMENTS)));
     
     private boolean removeSignature = true;
     private boolean persistSignature = true;
@@ -143,34 +158,24 @@ public class AbstractXmlSigInHandler extends AbstractXmlSecInHandler {
         if (!valid) {
             throwFault("Signature validation failed", null);
         }
+        Element signedEl = getSignedElement(root, ref);
+        // Only pass on the signed element. This is the root for an enveloped signature, and
+        // a child of the (unsigned) root for a detached signature. The reader's document
+        // is still the full document, e.g. for SamlEnvelopedInHandler to get the assertion
+        Element body = isEnveloping(root) ? root : signedEl;
         if (removeSignature) {
             if (!isEnveloping(root)) {
-                Element signedEl = getSignedElement(root, ref);
                 signedEl.removeAttribute("ID");
                 root.removeChild(signatureElement);
             } else {
-                Element actualBody = getActualBody(root);
                 Document newDoc = DOMUtils.createDocument();
-                newDoc.adoptNode(actualBody);
-                root = actualBody;
+                newDoc.adoptNode(signedEl);
+                body = signedEl;
             }
         }
         message.setContent(XMLStreamReader.class, 
-                           new W3CDOMStreamReader(root));
+                           new W3CDOMStreamReader(body));
         message.setContent(InputStream.class, null);
-        
-    }
-    
-    private Element getActualBody(Element envelopingSigElement) {
-        Element objectNode = getNode(envelopingSigElement, Constants.SignatureSpecNS, "Object", 0);
-        if (objectNode == null) {
-            throwFault("Object envelope is not available", null);
-        }
-        Element node = DOMUtils.getFirstElement(objectNode);
-        if (node == null) {
-            throwFault("No signed data is found", null);
-        }
-        return node;
        
     }
     
@@ -227,19 +232,35 @@ public class AbstractXmlSigInHandler extends AbstractXmlSecInHandler {
         String c14TransformExpected = sigProps != null ? sigProps.getSignatureC14Transform() : null;
         boolean envelopedConfirmed = false;
         for (int i = 0; i < transforms.getLength(); i++) {
+            String transformURI = null;
             try {
                 Transform tr = transforms.item(i);
-                if (Transforms.TRANSFORM_ENVELOPED_SIGNATURE.equals(tr.getURI())) {
-                    envelopedConfirmed = true;
-                } else if (c14TransformExpected != null && c14TransformExpected.equals(tr.getURI())) {
-                    c14TransformConfirmed = true;
-                } 
+                transformURI = tr.getURI();
             } catch (Exception ex) {
                 throwFault("Problem accessing Transform instance", ex);    
+            }
+            // Only allow transforms which cover the whole of the signed element, so that
+            // no unsigned content (e.g. excluded via XPath) is passed on to the application
+            if (!ALLOWED_TRANSFORMS.contains(transformURI)) {
+                throwFault("Signature Transform is not supported", null);
+            }
+            if (Transforms.TRANSFORM_ENVELOPED_SIGNATURE.equals(transformURI)) {
+                envelopedConfirmed = true;
+            } else if (c14TransformExpected != null && c14TransformExpected.equals(transformURI)) {
+                c14TransformConfirmed = true;
             }
         }
         if (enveloped && !envelopedConfirmed) {
             throwFault("Only enveloped signatures are currently supported", null);
+        }
+        // The Signature is a child of the document root, so an enveloped signature
+        // must reference the root. Otherwise the signed element could be wrapped in
+        // unsigned content which would then be passed on to the application.
+        if (envelopedConfirmed && !enveloped) {
+            throwFault("Enveloped signature must reference the document root", null);
+        }
+        if (isEnveloping(root)) {
+            validateEnvelopingReference(root, signedEl);
         }
         if (c14TransformExpected != null && !c14TransformConfirmed) {
             throwFault("Transform Canonicalization is not supported", null);
@@ -254,6 +275,17 @@ public class AbstractXmlSigInHandler extends AbstractXmlSecInHandler {
             }
         }
         return signedEl;
+    }
+
+    // The signed element must be the only element in the only Object of the enveloping
+    // Signature, so that no unsigned content can be passed on to the application
+    private void validateEnvelopingReference(Element root, Element signedEl) {
+        List<Element> objects = DOMUtils.getChildrenWithName(root, Constants.SignatureSpecNS, "Object");
+        if (objects.size() != 1 || signedEl.getParentNode() != objects.get(0)
+            || DOMUtils.getFirstElement(objects.get(0)) != signedEl
+            || DOMUtils.getNextElement(signedEl) != null) {
+            throwFault("Enveloping signature must reference the signed Object content", null);
+        }
     }
     
     private Element getSignedElement(Element root, Reference ref) {
